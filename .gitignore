@@ -1,0 +1,15 @@
+.env
+.env.*
+*.env
+*.env.*
+.venv/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+downloads/
+*.mp4
+*.part
+.icourse-dl-*.lock
+.icourse-dl-*.work*

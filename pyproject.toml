@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "icourse-dl"
+version = "0.1.0"
+description = "Authorized iCourse video downloader"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = ["requests>=2.32.2,<3", "pycryptodome>=3.20,<4", "python-dotenv>=1,<2", "yt-dlp==2026.8.19"]
+
+[project.optional-dependencies]
+remember = ["keyring==25.7.0"]
+
+[project.scripts]
+icourse-dl = "icourse_dl.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/icourse_dl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
