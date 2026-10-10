@@ -1,0 +1,32 @@
+name: Offline verification
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python: ['3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run pytest -q
+      - run: uv run python tests/smoke_download.py
+      - run: uv build --wheel
+      - shell: python
+        run: |
+          import pathlib, subprocess, tempfile, os
+          root = pathlib.Path.cwd()
+          with tempfile.TemporaryDirectory() as temp:
+              env = pathlib.Path(temp) / 'env'
+              subprocess.run(['uv', 'venv', str(env), '--python', '${{ matrix.python }}'], check=True)
+              binary = env / ('Scripts' if os.name == 'nt' else 'bin')
+              python = binary / ('python.exe' if os.name == 'nt' else 'python')
+              entry = binary / ('icourse-dl.exe' if os.name == 'nt' else 'icourse-dl')
+              subprocess.run(['uv', 'pip', 'install', '--python', str(python), str(next((root / 'dist').glob('*.whl')))], check=True)
+              subprocess.run([str(entry), '--help'], cwd=temp, check=True)
+              subprocess.run([str(python), '-m', 'icourse_dl', '--help'], cwd=temp, check=True)
+              subprocess.run([str(python), str(root / 'tests/smoke_download.py')], cwd=temp, check=True)

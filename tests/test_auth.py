@@ -351,3 +351,63 @@ def test_unsupported_authentication_method_stops():
 def test_http_permission_status_remains_available_to_client():
     response = SafeHTTP(FakeSession([FakeResponse(status=403)])).request("GET", vpn_url(ICOURSE + "/courseapi/example"))
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("step", [5, 6])
+def test_engine_and_ticket_timeout_never_replays(step):
+    _, session = make_login_fixture()
+    session.responses[step] = requests.ReadTimeout("synthetic-secret")
+    session.responses[step + 1:] = [FakeResponse({"code": 401})]
+    with pytest.raises(NetworkUnavailable):
+        Authenticator(session).login(Credentials("student-test", "pw", "env"))
+    assert len(session.calls) == step + 2
+    assert sum("infosimple" in url for _, url, _ in session.calls) == 1
+
+
+def test_ticket_redirect_never_gets_read_only_retry_budget():
+    session = FakeSession([
+        FakeResponse(status=302, headers={"Location": WEBVPN + "/login?ticket=ST-test"}),
+        requests.ReadTimeout("synthetic-secret"),
+    ])
+    with pytest.raises(NetworkUnavailable):
+        SafeHTTP(session, sleep=lambda _: pytest.fail("must not retry ticket")).request("GET", IDP + "/readonly", retry=True)
+    assert len(session.calls) == 2
+
+
+def test_engine_location_header_supported():
+    _, session = make_login_fixture(sso=True)
+    session.responses[5] = FakeResponse(status=302, headers={"Location": WEBVPN + "/login?cas_login=true&ticket=ST-test"})
+    assert Authenticator(session).login(Credentials("student-test", "pw", "env")).account == "student-test"
+
+
+def test_proxied_literal_login_context():
+    _, session = make_login_fixture()
+    session.responses[7:9] = [FakeResponse(body=b'<script>var lck = "course-context";</script>')]
+    assert Authenticator(session).login(Credentials("student-test", "pw", "env")).account == "student-test"
+    assert sum("authExecute" in url for _, url, _ in session.calls) == 2
+
+
+def test_script_expression_is_not_treated_as_literal_ticket():
+    _, session = make_login_fixture()
+    session.responses[5] = FakeResponse(body=b'<script>locationValue="https://webvpn.fudan.edu.cn/login?ticket=ST-test" + untrusted;</script>')
+    with pytest.raises(ProtocolError):
+        Authenticator(session).login(Credentials("student-test", "pw", "env"))
+    assert len(session.calls) == 6
+
+
+@pytest.mark.parametrize("url", [
+    WEBVPN + "/%68ttps/77726476706e69737468656265737421aa/",
+    vpn_url(ICOURSE + "/%2e%2e/%2e%2e/https/unknown"),
+    WEBVPN + "/https/not-a-valid-host/",
+])
+def test_noncanonical_proxy_target_rejected(url):
+    with pytest.raises(ProtocolError):
+        validate_official_url(url)
+
+
+def test_same_endpoint_307_does_not_replay_password():
+    session = FakeSession([FakeResponse(status=307, headers={"Location": IDP + "/auth"})])
+    with pytest.raises(ProtocolError):
+        SafeHTTP(session).request("POST", IDP + "/auth", json={"password": "synthetic"})
+    assert len(session.calls) == 1
+
