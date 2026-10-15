@@ -6,7 +6,7 @@ import hashlib
 import ipaddress
 import re
 import time
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import requests
@@ -19,6 +19,15 @@ from .errors import ConfigurationError, PermissionDenied, ProtocolError
 class CourseTarget:
     course_id: str
     lecture_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Course:
+    course_id: str
+    title: str
+    course_code: str
+    term_name: str
+    term_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -47,30 +56,8 @@ def _id(value: object, error: type[Exception] = ConfigurationError) -> str:
     return normalized
 
 
-def parse_target(url: str | None, course_id: str | None,
-                 lecture_id: str | None) -> CourseTarget:
-    """Extract IDs only; never request a user-supplied URL."""
-    if url is not None and course_id is not None:
-        raise ConfigurationError("课程链接与 --course-id 不能同时使用。")
-    if url is not None:
-        try:
-            parts = urlsplit(url)
-            if (any(ord(c) <= 32 or ord(c) == 127 for c in url)
-                    or parts.scheme != "https"
-                    or parts.hostname != "icourse.fudan.edu.cn"
-                    or parts.username is not None or parts.password is not None
-                    or parts.port not in (None, 443)
-                    or parts.path not in ("/coursedetail", "/coursedetail/")
-                    or "#" in url):
-                raise ValueError
-            query = parse_qs(parts.query, keep_blank_values=True)
-            ids = query.get("course_id", [])
-            tenants = query.get("tenant_code", ["222"])
-            if len(ids) != 1 or tenants != ["222"]:
-                raise ValueError
-            course_id = ids[0]
-        except ValueError:
-            raise ConfigurationError("不支持的课程链接，请改用 --course-id。") from None
+def parse_target(course_id: str | None, lecture_id: str | None) -> CourseTarget:
+    """Validate and normalize explicitly supplied course and lecture IDs."""
     return CourseTarget(_id(course_id), None if lecture_id is None else _id(lecture_id))
 
 
@@ -100,6 +87,18 @@ def _text(item: dict, key: str) -> str:
     if not isinstance(value, str):
         raise ProtocolError("课次文本字段不兼容。")
     return value
+
+
+def _course(record: dict) -> Course:
+    course_id = _id(str(record.get('id', '')), ProtocolError)
+    fields = [record.get(key) for key in ('title', 'course_code', 'term_name', 'term')]
+    if not all(isinstance(value, str) and value.strip() for value in fields):
+        raise ProtocolError('Incomplete course catalog record.')
+    name, code, term_name, membership = fields
+    if not re.fullmatch(r'_(?:[1-9][0-9]*_)+', membership):
+        raise ProtocolError('Invalid course semester membership.')
+    term_ids = tuple(dict.fromkeys(membership.strip('_').split('_')))
+    return Course(course_id, name, code, term_name, term_ids)
 
 
 def _media_parts(url: str):
@@ -161,6 +160,52 @@ class ICourseClient:
             raise PermissionDenied("课程接口拒绝当前请求。")
         _mapping(body.get("data"))
         return body
+
+    def search_courses(self, title: str, term: str | None = None) -> list[Course]:
+        filters = {} if term is None else {'term': _id(term)}
+        title = title.strip()
+        if not title:
+            raise ConfigurationError('A nonempty course name or keyword is required.')
+        courses: dict[str, Course] = {}
+        total = None
+        page = 1
+        while True:
+            data = self._get('/portal/courseapi/v3/multi-search/get-course-list',
+                             tenant='222', title=title, **filters,
+                             page=str(page), per_page='100')['data']
+            count = data.get('total')
+            if type(count) not in (str, int) or not re.fullmatch(r'[0-9]+', str(count)):
+                raise ProtocolError('Invalid course catalog total.')
+            count = int(count)
+            if total is not None and count != total:
+                raise ProtocolError('Course catalog changed during pagination; repeat the search.')
+            total = count
+            rows = data.get('list')
+            if not isinstance(rows, list):
+                raise ProtocolError('Invalid course catalog list.')
+            before = len(courses)
+            for row in rows:
+                course = _course(_mapping(row))
+                if term is not None and filters['term'] not in course.term_ids:
+                    raise ProtocolError('Course catalog returned a different semester.')
+                if course.course_id in courses and courses[course.course_id] != course:
+                    raise ProtocolError('Conflicting course catalog records.')
+                courses[course.course_id] = course
+            if len(courses) > total:
+                raise ProtocolError('Course catalog exceeded its declared total.')
+            if len(courses) == total:
+                return list(courses.values())
+            if len(courses) == before:
+                raise ProtocolError('Course catalog pagination stopped before all results were received.')
+            page += 1
+
+    def get_course(self, course_id: str) -> Course:
+        course_id = _id(course_id)
+        course = _course(self._get('/courseapi/v3/multi-search/get-course-detail',
+                                  course_id=course_id)['data'])
+        if course.course_id != course_id:
+            raise ProtocolError('Course detail returned a different course.')
+        return course
 
     def get_lectures(self, course_id: str) -> list[Lecture]:
         course_id = _id(course_id)

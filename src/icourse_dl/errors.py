@@ -14,11 +14,17 @@ class PermissionDenied(ICourseError):
 class DownloadFailure(ICourseError):
     exit_code = 5
 
-class StorageFailure(ICourseError):
-    exit_code = 6
-
 class NetworkUnavailable(ICourseError):
     exit_code = 7
+
+    def __init__(self, message: str, *, retryable: bool = False,
+                 reason: str = "request-failed", method: str | None = None,
+                 status: int | None = None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.reason = reason
+        self.method = method
+        self.status = status
 
 class ProtocolError(ICourseError):
     exit_code = 8

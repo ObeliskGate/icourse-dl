@@ -43,6 +43,8 @@ _VPN_KEY = b"wrdvpnisthebest!"
 _HOSTS = {"webvpn.fudan.edu.cn", "id.fudan.edu.cn", "icourse.fudan.edu.cn"}
 _REDIRECTS = {301, 302, 303, 307, 308}
 _TRANSIENT = {408, 429, 500, 502, 503, 504}
+_LOG = logging.getLogger(__name__)
+AUTH_BUDGET = 300.0
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,7 @@ def prompt_credentials(expected_account: str | None = None) -> Credentials:
             raise ConfigurationError("Enter the complete credentials for the selected account.")
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
-            password = getpass.getpass("UISPsw: ")
+            password = getpass.getpass("Password: ")
     except (getpass.GetPassWarning, EOFError, OSError):
         raise ConfigurationError("Hidden password input is unavailable.") from None
     if password == "":
@@ -115,15 +117,23 @@ def prompt_credentials(expected_account: str | None = None) -> Credentials:
 
 
 def _url_parts(url: str):
-    if not isinstance(url, str) or not url or any(ord(c) <= 32 or ord(c) == 127 for c in url) or "\\" in url:
-        raise ProtocolError("Invalid URL in the server protocol.")
+    if not isinstance(url, str) or not url:
+        raise ProtocolError("URL rejected: empty-or-non-string.")
+    if any(ord(c) <= 32 or ord(c) == 127 for c in url):
+        raise ProtocolError("URL rejected: whitespace-or-control-character.")
+    if "\\" in url:
+        raise ProtocolError("URL rejected: backslash.")
     try:
         parsed = urlsplit(url)
         port = parsed.port
     except ValueError:
-        raise ProtocolError("Invalid URL in the server protocol.") from None
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment:
-        raise ProtocolError("Invalid URL in the server protocol.")
+        raise ProtocolError("URL rejected: malformed-authority-or-port.") from None
+    for rejected, reason in ((parsed.scheme not in {"http", "https"}, "unsupported-scheme"),
+                             (not parsed.hostname, "missing-host"),
+                             (parsed.username is not None or parsed.password is not None, "embedded-userinfo"),
+                             (bool(parsed.fragment), "fragment")):
+        if rejected:
+            raise ProtocolError(f"URL rejected: {reason}.")
     return parsed, port
 
 
@@ -131,7 +141,8 @@ def _redirect_url(base: str, location: str) -> str:
     # urljoin silently removes some controls: reject before normalization.
     if not location or any(ord(c) <= 32 or ord(c) == 127 for c in location) or "\\" in location:
         raise ProtocolError("The server returned an invalid redirect destination.")
-    result = urljoin(base, location)
+    # Fragments are browser-local; never send them or interpret them as queries.
+    result = urljoin(base, location).split("#", 1)[0]
     validate_official_url(result)
     return result
 
@@ -222,12 +233,32 @@ class SafeHTTP:
     POST bodies may never follow 307/308 to a different endpoint. Proxy mode
     keeps direct official redirect targets behind WebVPN. No response is logged.
     """
-    def __init__(self, session: requests.Session, *, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, session: requests.Session, *, sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic):
         self.session = session
         self.sleep = sleep
+        self.clock = clock
+        self.deadline: float | None = None
         session.trust_env = False
         session.auth = None
         session.headers.update({"User-Agent": USER_AGENT})
+
+    def remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise NetworkUnavailable("The authentication time budget was exhausted.",
+                                     reason="authentication-budget")
+        return remaining
+
+    def wait(self, delay: float) -> None:
+        remaining = self.remaining()
+        if remaining is not None and delay >= remaining:
+            raise NetworkUnavailable("The authentication time budget cannot accommodate another wait.",
+                                     reason="authentication-budget")
+        self.sleep(delay)
+        self.remaining()
 
     def _delay(self, headers: dict[str, str], attempt: int) -> float:
         value = headers.get("Retry-After")
@@ -244,7 +275,8 @@ class SafeHTTP:
             except (ValueError, TypeError, OverflowError):
                 pass
         if delay > 30:
-            raise NetworkUnavailable("The server requested a longer retry delay; try again later.")
+            raise NetworkUnavailable("The server requested a longer retry delay; try again later.",
+                                     reason="retry-after-limit")
         return delay
 
     def request(self, method: str, url: str, *, max_bytes: int = AUTH_LIMIT,
@@ -261,35 +293,47 @@ class SafeHTTP:
             attempts = 3 if retry and _query_one(url, "ticket") is None else 1
             for attempt in range(attempts):
                 response = None
+                remaining = self.remaining()
+                timeout = (10, 30) if remaining is None or remaining >= 40 else (
+                    min(10, remaining / 2), min(30, remaining / 2))
                 try:
                     response = self.session.request(method, url, headers=request_headers,
                         json=json, data=data, allow_redirects=False, stream=True,
-                        timeout=(10, 30), verify=True)
+                        timeout=timeout, verify=True)
                     status = response.status_code
                     response_headers = requests.structures.CaseInsensitiveDict(response.headers)
                     if status in _TRANSIENT:
                         if attempt + 1 >= attempts:
-                            raise NetworkUnavailable("The school service is temporarily unavailable.")
+                            raise NetworkUnavailable("The school service is temporarily unavailable.",
+                                retryable=True, reason="transient-http", method=method, status=status)
                         delay = self._delay(response_headers, attempt) if status == 429 else attempt + 1
                         response.close()
-                        self.sleep(delay)
+                        self.wait(delay)
                         continue
                     body = bytearray()
                     for chunk in response.iter_content(chunk_size=min(65536, max_bytes + 1)):
+                        self.remaining()
                         if len(body) + len(chunk) > max_bytes:
                             raise ProtocolError("The server response exceeded the protocol size limit.")
                         body.extend(chunk)
+                    self.remaining()
                     result = HTTPResponse(status, response_headers, bytes(body), url, tuple(history))
                 except requests.exceptions.SSLError:
-                    raise NetworkUnavailable("The secure connection to the school service failed.") from None
+                    raise NetworkUnavailable("The secure connection to the school service failed.",
+                        reason="tls-verification", method=method) from None
                 except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
-                        requests.exceptions.ChunkedEncodingError):
+                        requests.exceptions.ChunkedEncodingError) as exc:
                     if attempt + 1 >= attempts:
-                        raise NetworkUnavailable("The school service could not be reached reliably.") from None
-                    self.sleep(attempt + 1)
+                        reason = ("timeout" if isinstance(exc, requests.exceptions.Timeout) else
+                                  "response-interrupted" if isinstance(exc, requests.exceptions.ChunkedEncodingError)
+                                  else "connection")
+                        raise NetworkUnavailable("The school service could not be reached reliably.",
+                            retryable=True, reason=reason, method=method) from None
+                    self.wait(attempt + 1)
                     continue
                 except requests.exceptions.RequestException:
-                    raise NetworkUnavailable("The request to the school service failed.") from None
+                    raise NetworkUnavailable("The request to the school service failed.",
+                        reason="request-failed", method=method) from None
                 finally:
                     if response is not None:
                         response.close()
@@ -299,9 +343,12 @@ class SafeHTTP:
             location = result.headers.get("Location")
             if not location or hop == 10:
                 raise ProtocolError("Invalid or excessive server redirects.")
-            next_url = _redirect_url(url, location)
-            if proxy_redirects:
-                next_url = vpn_url(next_url)
+            try:
+                next_url = _redirect_url(url, location)
+                if proxy_redirects:
+                    next_url = vpn_url(next_url)
+            except ProtocolError as exc:
+                raise ProtocolError(f"HTTP redirect hop={hop + 1} status={result.status_code}: {exc}") from None
             if method != "GET" and result.status_code in {307, 308}:
                 raise ProtocolError("A redirect attempted to forward an authentication body.")
             history.append(url)
@@ -319,9 +366,13 @@ class SafeHTTP:
         return parse_json(response)
 
 
+class _Unauthenticated(AuthenticationError):
+    """Explicitly logged out, distinct from an authenticated account mismatch."""
+
+
 def _require_success(response: HTTPResponse) -> None:
     if response.status_code in {401, 403}:
-        raise AuthenticationError("The school session is not authenticated.")
+        raise _Unauthenticated("The school session is not authenticated.")
     if not 200 <= response.status_code < 300:
         raise ProtocolError("The school service returned an unexpected HTTP status.")
 
@@ -384,23 +435,56 @@ class _AuthHTML(HTMLParser):
 
 
 class _UncertainAuthentication(NetworkUnavailable):
-    pass
+    def __init__(self, failure: NetworkUnavailable):
+        super().__init__(str(failure), retryable=failure.retryable, reason=failure.reason,
+                         method=failure.method, status=failure.status)
 
 
 class Authenticator:
-    def __init__(self, session: requests.Session):
+    def __init__(self, session: requests.Session, *, sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic):
         self.session = session
-        self.http = SafeHTTP(session)
+        self.http = SafeHTTP(session, sleep=sleep, clock=clock)
+        self.round = 0
+        self._stage = "identity-probe"
+
+    @property
+    def stage(self) -> str:
+        return self._stage
+
+    @stage.setter
+    def stage(self, value: str) -> None:
+        self._stage = value
+        _LOG.info("Authentication round=%d stage=%s", self.round, value)
 
     def _context(self, url: str, *, proxied: bool) -> str | None:
-        response = self.http.request("GET", url, proxy_redirects=proxied)
-        _require_success(response)
-        contexts = set()
-        for candidate in (*response.history, response.url):
-            validate_official_url(candidate)
-            context = _query_one(candidate, "lck")
+        contexts: set[str] = set()
+        for hop in range(11):
+            validate_official_url(url)
+            context = _query_one(url, "lck")
             if context is not None:
                 contexts.add(context)
+            response = self.http.request("GET", url, follow_redirects=False,
+                                         proxy_redirects=proxied)
+            if response.status_code not in _REDIRECTS:
+                _require_success(response)
+                break
+            location = response.headers.get("Location")
+            if not location or hop == 10:
+                raise ProtocolError("Invalid or excessive login-context redirects.")
+            # Validate the actual destination before reading browser-route context.
+            try:
+                next_url = _redirect_url(url, location)
+            except ProtocolError as exc:
+                raise ProtocolError(f"HTTP redirect hop={hop + 1} status={response.status_code}: {exc}") from None
+            ordinary = urlsplit(validate_official_url(next_url))
+            if ordinary.hostname == "id.fudan.edu.cn" and ordinary.path.rstrip("/") == "/ac":
+                fragment = urlsplit(location).fragment
+                if "?" in fragment:
+                    context = _query_one("https://id.fudan.edu.cn/ac/?" + fragment.split("?", 1)[1], "lck")
+                    if context is not None:
+                        contexts.add(context)
+            url = vpn_url(next_url) if proxied else next_url
         page_context = _AuthHTML(response.text).literal("lck")
         if page_context is not None:
             contexts.add(_nonempty(page_context))
@@ -411,13 +495,16 @@ class Authenticator:
     def _side_effect(self, method: str, url: str, **kwargs) -> HTTPResponse:
         try:
             return self.http.request(method, url, **kwargs)
-        except NetworkUnavailable:
-            raise _UncertainAuthentication("The authentication result could not be confirmed.") from None
+        except NetworkUnavailable as exc:
+            if not exc.retryable:
+                raise
+            raise _UncertainAuthentication(exc) from None
 
     def _authenticate_stage(self, credentials: Credentials, lck: str, *, proxied: bool) -> None:
         entity = ICOURSE if proxied else WEBVPN
         encode = vpn_url if proxied else lambda value: value
         headers = {"Origin": WEBVPN if proxied else IDP, "Referer": encode(IDP + "/ac/")}
+        self.stage = ("icourse" if proxied else "webvpn") + ":query-auth-methods"
         methods_response = self.http.request("POST", encode(IDP + "/idp/authn/queryAuthMethods"),
             json={"lck": lck, "entityId": entity}, headers=headers, proxy_redirects=proxied)
         _require_success(methods_response)
@@ -430,6 +517,7 @@ class Authenticator:
             raise AuthenticationError("Password authentication is unavailable; complete unsupported authentication locally.")
         chain = _nonempty(selected.get("authChainCode"))
         request_type = _nonempty(methods.get("requestType", "chain_type"))
+        self.stage = ("icourse" if proxied else "webvpn") + ":public-key"
         key_response = self.http.request("GET", encode(IDP + "/idp/authn/getJsPublicKey"),
             retry=True, headers=headers, proxy_redirects=proxied)
         _require_success(key_response)
@@ -440,6 +528,7 @@ class Authenticator:
             encrypted = base64.b64encode(PKCS1_v1_5.new(key).encrypt(credentials.password.encode("utf-8"))).decode("ascii")
         except (ValueError, TypeError, IndexError):
             raise ProtocolError("The password encryption parameters are incompatible.") from None
+        self.stage = ("icourse" if proxied else "webvpn") + ":password-submit"
         executed = self._side_effect("POST", encode(IDP + "/idp/authn/authExecute"),
             headers=headers, proxy_redirects=proxied,
             json={"authModuleCode": "userAndPwd", "authChainCode": chain,
@@ -450,6 +539,7 @@ class Authenticator:
         if result.get("code") not in (200, "200") or isinstance(result.get("code"), bool):
             raise AuthenticationError("Authentication was refused; check credentials or complete any challenge locally.")
         token = _nonempty(result.get("loginToken"))
+        self.stage = ("icourse" if proxied else "webvpn") + ":ticket-exchange"
         engine = self._side_effect("POST", encode(IDP + "/idp/authCenter/authnEngine"),
             data={"loginToken": token}, headers=headers, follow_redirects=False)
         if engine.status_code in _REDIRECTS:
@@ -467,31 +557,113 @@ class Authenticator:
         expected_path = "/casapi/index.php" if proxied else "/login"
         if target.hostname != expected_host or target.path != expected_path or not _query_one(original, "ticket"):
             raise ProtocolError("The authentication ticket has an unapproved destination.")
+        self.stage = ("icourse" if proxied else "webvpn") + ":ticket-consume"
         consumed = self._side_effect("GET", encode(ticket), proxy_redirects=proxied)
         _require_success(consumed)
 
+    def _login_round(self, credentials: Credentials) -> Identity:
+        self.stage = "webvpn:login-context"
+        # Enter through the service so its initial cookies survive the CAS round-trip.
+        context = self._context(WEBVPN + "/login?cas_login=true", proxied=False)
+        if context is None:
+            raise ProtocolError("WebVPN authentication did not return a login context.")
+        self._authenticate_stage(credentials, context, proxied=False)
+        course_login = ICOURSE + "/casapi/index.php?r=auth/login&school_login=1&tenant_code=222&forward=" + quote(ICOURSE + "/", safe="")
+        self.stage = "icourse:login-context"
+        context = self._context(vpn_url(course_login), proxied=True)
+        if context is not None:
+            self._authenticate_stage(credentials, context, proxied=True)
+        self.stage = "identity-probe"
+        return self._probe_identity(credentials.account, retry=True)
+
+    def _network_failure(self, failure: NetworkUnavailable, stage: str,
+                         verification: Exception | None = None) -> NetworkUnavailable:
+        message = (f"Authentication round={self.round} stage={stage}: "
+                   f"initial={failure.reason} method={failure.method or 'none'} "
+                   f"status={failure.status if failure.status is not None else 'none'}.")
+        if verification is not None:
+            cause = (f"{verification.reason} method={verification.method or 'none'} "
+                     f"status={verification.status if verification.status is not None else 'none'}"
+                     if isinstance(verification, NetworkUnavailable) else str(verification))
+            message += f" Verification stage=identity-probe: {cause}"
+        _LOG.warning("%s", message)
+        return NetworkUnavailable(message, retryable=failure.retryable, reason=failure.reason,
+                                  method=failure.method, status=failure.status)
+
     def login(self, credentials: Credentials) -> Identity:
+        """Try at most three complete contexts, waiting 1s then 2s.
+
+        Reset cookies, not the caller's Session or TCP connection pool. Each
+        round re-enters the entry/context chain; password bodies and tickets
+        from an interrupted round are never replayed. An ambiguous write is
+        first checked by the normal three-attempt read-only identity probe.
+        One monotonic five-minute budget covers rounds, reads and waits;
+        socket timeouts shrink near its end and streamed chunks check it too.
+        """
         if not credentials.account or credentials.password == "":
             raise ConfigurationError("Complete credentials are required.")
+        self.http.deadline = self.http.clock() + AUTH_BUDGET
+        authenticated = False
         try:
-            context = self._context(IDP + "/idp/authCenter/authenticate?service=" + quote(WEBVPN + "/login?cas_login=true", safe=""), proxied=False)
-            if context is None:
-                raise ProtocolError("WebVPN authentication did not return a login context.")
-            self._authenticate_stage(credentials, context, proxied=False)
-            course_login = ICOURSE + "/casapi/index.php?r=auth/login&school_login=1&tenant_code=222&forward=" + quote(ICOURSE + "/", safe="")
-            context = self._context(vpn_url(course_login), proxied=True)
-            if context is not None:
-                self._authenticate_stage(credentials, context, proxied=True)
-        except _UncertainAuthentication:
-            # No password/ticket replay: a single read-only confirmation is allowed.
-            try:
-                return self._probe_identity(credentials.account, retry=False)
-            except (AuthenticationError, ProtocolError, NetworkUnavailable):
-                raise NetworkUnavailable("Authentication was interrupted; its result is unconfirmed. Try again later.") from None
-        return self.probe_identity(credentials.account)
+            for self.round in range(1, 4):
+                self.session.cookies.clear()
+                verification = None
+                try:
+                    identity = self._login_round(credentials)
+                except NetworkUnavailable as exc:
+                    failure, failed_stage = exc, self.stage
+                except (ProtocolError, AuthenticationError) as exc:
+                    raise type(exc)(f"Authentication round={self.round} stage={self.stage}: {exc}") from None
+                else:
+                    authenticated = True
+                    return identity
+                if isinstance(failure, _UncertainAuthentication):
+                    _LOG.warning("Authentication round=%d stage=%s initial=%s method=%s status=%s; verifying identity",
+                                 self.round, failed_stage, failure.reason, failure.method,
+                                 failure.status if failure.status is not None else "none")
+                    self.stage = "identity-probe"
+                    try:
+                        identity = self._probe_identity(credentials.account, retry=True)
+                    except (AuthenticationError, ProtocolError, NetworkUnavailable) as exc:
+                        verification = exc
+                        if not isinstance(exc, _Unauthenticated) and not (
+                            isinstance(exc, NetworkUnavailable) and exc.retryable
+                        ):
+                            combined = self._network_failure(failure, failed_stage, exc)
+                            if isinstance(exc, NetworkUnavailable):
+                                raise NetworkUnavailable(str(combined), reason=exc.reason,
+                                                         method=exc.method, status=exc.status) from None
+                            raise type(exc)(str(combined)) from None
+                    else:
+                        _LOG.info("Authentication round=%d stage=%s verification=confirmed",
+                                  self.round, self.stage)
+                        authenticated = True
+                        return identity
+                error = self._network_failure(failure, failed_stage, verification)
+                if not failure.retryable or self.round == 3:
+                    raise error from None
+                self.session.cookies.clear()
+                _LOG.warning("Authentication round=%d stage=%s retry-wait=%ds next-round=%d",
+                             self.round, failed_stage, self.round, self.round + 1,
+                             extra={"retry_round": self.round + 1, "retry_delay": self.round})
+                try:
+                    self.http.wait(self.round)
+                except NetworkUnavailable as exc:
+                    raise NetworkUnavailable(f"{error} Retry stopped: {exc.reason}.",
+                                             reason=exc.reason) from None
+        finally:
+            self.http.deadline = None
+            if not authenticated:
+                self.session.cookies.clear()
 
     def probe_identity(self, expected_account: str | None = None) -> Identity:
-        return self._probe_identity(expected_account, retry=True)
+        self.stage = "identity-probe"
+        try:
+            return self._probe_identity(expected_account, retry=True)
+        except NetworkUnavailable as exc:
+            raise self._network_failure(exc, self.stage) from None
+        except (ProtocolError, AuthenticationError) as exc:
+            raise type(exc)(f"Authentication stage=identity-probe: {exc}") from None
 
     def _probe_identity(self, expected_account: str | None, *, retry: bool) -> Identity:
         response = self.http.request("GET", vpn_url(ICOURSE + "/userapi/v1/infosimple"), retry=retry, proxy_redirects=True)
@@ -500,16 +672,22 @@ class Authenticator:
         parsed = urlsplit(ordinary)
         if parsed.hostname != "icourse.fudan.edu.cn" or parsed.path != "/userapi/v1/infosimple":
             if parsed.hostname in {"id.fudan.edu.cn", "webvpn.fudan.edu.cn"} or parsed.path.startswith("/casapi/"):
-                raise AuthenticationError("The saved school session has expired.")
+                # Only static categories are emitted, never paths or query values.
+                destination = ("webvpn" if parsed.hostname == "webvpn.fudan.edu.cn" else
+                               "idp" if parsed.hostname == "id.fudan.edu.cn" else "icourse-cas")
+                raise _Unauthenticated(
+                    f"Identity request redirected to {destination}; "
+                    f"redirects={len(response.history)}. The current session is not authenticated."
+                )
             raise ProtocolError("The identity endpoint redirected unexpectedly.")
         if response.content.lstrip().startswith(b"<"):
             if _AuthHTML(response.text).has_password:
-                raise AuthenticationError("The school session requires login.")
+                raise _Unauthenticated("The school session requires login.")
             raise ProtocolError("The identity endpoint returned HTML instead of JSON.")
         payload = parse_json(response)
         code = payload.get("code")
         if code in (401, 403, "401", "403"):
-            raise AuthenticationError("The school session is not authenticated.")
+            raise _Unauthenticated("The school session is not authenticated.")
         if isinstance(code, bool) or code not in (0, 200, "0", "200"):
             raise ProtocolError("The identity endpoint returned an unrecognized business status.")
         params, data = payload.get("params"), payload.get("data")

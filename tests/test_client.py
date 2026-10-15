@@ -40,38 +40,17 @@ def make_client(responses):
     return instance
 
 
-@pytest.mark.parametrize("url", [
-    "http://icourse.fudan.edu.cn/coursedetail?course_id=1",
-    "https://evil.example/coursedetail?course_id=1",
-    "https://icourse.fudan.edu.cn.evil.example/coursedetail?course_id=1",
-    "https://user@icourse.fudan.edu.cn/coursedetail?course_id=1",
-    "https://icourse.fudan.edu.cn:444/coursedetail?course_id=1",
-    "https://icourse.fudan.edu.cn/coursedetail?course_id=1&course_id=1",
-    "https://icourse.fudan.edu.cn/coursedetail?course_id=1&tenant_code=223",
-    "https://icourse.fudan.edu.cn/coursedetail?course_id=1&tenant_code=222&tenant_code=222",
-    "https://icourse.fudan.edu.cn/coursedetail?course_id=1#",
-    "https://icourse.fudan.edu.cn/lecture?course_id=1",
-    "https://icourse.fudan.edu.cn/coursedetail?course_id=",
-    "\nhttps://icourse.fudan.edu.cn/coursedetail?course_id=1",
-])
-def test_invalid_urls(url):
-    with pytest.raises(ConfigurationError):
-        client.parse_target(url, None, None)
-
-
 @pytest.mark.parametrize("value", [None, "", "0", "000", "-1", "+1", " 1", "1,2", "１", "١", "1.0"])
 def test_invalid_ids(value):
     with pytest.raises(ConfigurationError):
-        client.parse_target(None, value, None)
+        client.parse_target(value, None)
 
 
 def test_input_normalization():
-    assert client.parse_target("https://icourse.fudan.edu.cn:443/coursedetail/?course_id=001&tenant_code=222", None, "007") == client.CourseTarget("1", "7")
-    assert client.parse_target(None, "002", None) == client.CourseTarget("2")
+    assert client.parse_target('001', '007') == client.CourseTarget('1', '7')
+    assert client.parse_target('002', None) == client.CourseTarget('2')
     with pytest.raises(ConfigurationError):
-        client.parse_target("https://icourse.fudan.edu.cn/coursedetail?course_id=1", "1", None)
-    with pytest.raises(ConfigurationError):
-        client.parse_target(None, "1", "0")
+        client.parse_target('1', '0')
 
 
 def test_listing_dates_duplicates_and_sorting():

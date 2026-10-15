@@ -9,16 +9,14 @@ description = "Authorized iCourse video downloader"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
-dependencies = ["requests>=2.32.2,<3", "pycryptodome>=3.20,<4", "python-dotenv>=1,<2", "yt-dlp==2026.8.19"]
-
-[project.optional-dependencies]
-remember = ["keyring==25.7.0"]
+dependencies = ["requests>=2.32.2,<3", "pycryptodome>=3.20,<4", "python-dotenv>=1,<2", "yt-dlp==2026.8.19", "keyring==25.7.0", "prompt-toolkit>=3.0.48,<4"]
 
 [project.scripts]
 icourse-dl = "icourse_dl.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10"]
+build = ["pyinstaller>=6.16,<7"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/icourse_dl"]

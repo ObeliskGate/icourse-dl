@@ -50,7 +50,8 @@ class FakeSession:
         assert kwargs["allow_redirects"] is False
         assert kwargs["stream"] is True
         assert kwargs["verify"] is True
-        assert kwargs["timeout"] == (10, 30)
+        connect_timeout, read_timeout = kwargs["timeout"]
+        assert 0 < connect_timeout <= 10 and 0 < read_timeout <= 30
         assert self.responses, "Unexpected extra request"
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -206,7 +207,7 @@ def test_vpn_url_roundtrip_and_port():
     assert "/http-8080/" in vpn_url("http://media.internal:8080/a.mp4?x=1")
 
 
-@pytest.mark.parametrize("url", ["http://id.fudan.edu.cn/a", "https://id.fudan.edu.cn.evil/a", "https://user@id.fudan.edu.cn/a", "https://id.fudan.edu.cn:444/a", "https://id.fudan.edu.cn/a#x", "https://id.fudan.edu.cn/\\evil", "https://id.fudan.edu.cn/\nfoo", vpn_url("https://evil.example/a"), vpn_url("http://id.fudan.edu.cn/a")])
+@pytest.mark.parametrize("url", ["http://id.fudan.edu.cn/a", "https://id.fudan.edu.cn.evil/a", "https://user@id.fudan.edu.cn/a", "https://id.fudan.edu.cn:444/a", "https://id.fudan.edu.cn/\\evil", "https://id.fudan.edu.cn/\nfoo", vpn_url("https://evil.example/a"), vpn_url("http://id.fudan.edu.cn/a")])
 def test_unsafe_redirect_is_never_requested(url):
     session = FakeSession([FakeResponse(status=302, headers={"Location": url})])
     with pytest.raises(ProtocolError):
@@ -302,13 +303,18 @@ def test_timeout_after_password_does_not_replay_and_confirms_once():
     assert len([call for call in session.calls if "infosimple" in call[1]]) == 1
 
 
-def test_timeout_confirmation_failure_remains_network_error():
+def test_timeout_confirmation_failure_restarts_bounded_fresh_rounds():
     _, session = make_login_fixture()
     session.responses[4] = requests.ReadTimeout("SECRET")
-    session.responses[5:] = [FakeResponse({"code": 401})]
+    session.responses[5:] = [FakeResponse({"code": 401}),
+                             requests.ConnectTimeout("SECRET"),
+                             requests.ConnectTimeout("SECRET")]
+    sleeps = []
     with pytest.raises(NetworkUnavailable):
-        Authenticator(session).login(Credentials("student-test", "pw", "env"))
-    assert len(session.calls) == 6
+        Authenticator(session, sleep=sleeps.append).login(Credentials("student-test", "pw", "env"))
+    assert len(session.calls) == 8
+    assert sleeps == [1, 2]
+    assert sum("authExecute" in url for _, url, _ in session.calls) == 1
 
 
 @pytest.mark.parametrize("replacement,error", [
@@ -357,9 +363,8 @@ def test_http_permission_status_remains_available_to_client():
 def test_engine_and_ticket_timeout_never_replays(step):
     _, session = make_login_fixture()
     session.responses[step] = requests.ReadTimeout("synthetic-secret")
-    session.responses[step + 1:] = [FakeResponse({"code": 401})]
-    with pytest.raises(NetworkUnavailable):
-        Authenticator(session).login(Credentials("student-test", "pw", "env"))
+    session.responses[step + 1:] = [identity_response()]
+    assert Authenticator(session).login(Credentials("student-test", "pw", "env")).account == "student-test"
     assert len(session.calls) == step + 2
     assert sum("infosimple" in url for _, url, _ in session.calls) == 1
 

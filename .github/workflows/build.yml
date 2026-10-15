@@ -1,0 +1,48 @@
+name: Native console executables
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Separate native builds, not a macOS universal binary or cross-compilation.
+        os: [windows-latest, macos-14, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Install locked runtime and packaging dependencies
+        run: uv sync --locked --no-dev --group build
+      - name: Build onefile console executable
+        run: uv run --locked --no-dev --group build pyinstaller --noconfirm --clean --distpath dist/executable --workpath build/pyinstaller icourse-dl.spec
+      - name: Smoke Windows executable outside checkout
+        if: runner.os == 'Windows'
+        run: uv run --locked --no-dev --group build python scripts/verify_frozen.py dist/executable/icourse-dl.exe
+      - name: Smoke macOS executable outside checkout
+        if: runner.os == 'macOS'
+        run: uv run --locked --no-dev --group build python scripts/verify_frozen.py dist/executable/icourse-dl
+      - name: Archive Windows executable, license and checksum
+        if: runner.os == 'Windows'
+        run: uv run --locked --no-dev --group build python scripts/package_frozen.py dist/executable/icourse-dl.exe --platform "${{ runner.os }}" --arch "${{ runner.arch }}"
+      - name: Archive macOS executable, license and checksum
+        if: runner.os == 'macOS'
+        run: uv run --locked --no-dev --group build python scripts/package_frozen.py dist/executable/icourse-dl --platform "${{ runner.os }}" --arch "${{ runner.arch }}"
+      - name: Upload isolated native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: icourse-dl-${{ runner.os }}-${{ runner.arch }}
+          path: dist/packages/icourse-dl-${{ runner.os }}-${{ runner.arch }}.*
+          if-no-files-found: error
+          compression-level: 0

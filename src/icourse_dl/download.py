@@ -10,13 +10,15 @@ import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
 import sys
-from typing import Callable, TYPE_CHECKING
+import time
+from typing import Callable, TextIO, TYPE_CHECKING
 from urllib.parse import urlsplit, urljoin
 from uuid import uuid4
 
@@ -276,6 +278,86 @@ class _QuietLogger:
     def error(self, message):
         pass
 
+class _DownloadProgress:
+    """Render only bounded numeric hook fields, never yt-dlp strings or metadata."""
+
+    def __init__(self, stream: TextIO | None = None, *, clock: Callable[[], float] = time.monotonic):
+        self.stream = sys.stderr if stream is None else stream
+        self.clock = clock
+        self.tty = self.stream.isatty()
+        self.last_update: float | None = None
+        self.width = 0
+        self.started = False
+        self.ended = False
+
+    @staticmethod
+    def _number(value) -> float | None:
+        if type(value) not in (int, float) or not 0 <= value <= 1e30:
+            return None
+        return float(value) if math.isfinite(value) else None
+
+    @staticmethod
+    def _bytes(value: float | None) -> str:
+        if value is None:
+            return '?'
+        for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+            if value < 1024 or unit == 'PiB':
+                return f'{value:.0f} B' if unit == 'B' else f'{value:.1f} {unit}'
+            value /= 1024
+        raise AssertionError('unreachable byte unit')
+
+    def __call__(self, event: dict) -> None:
+        status = event.get('status')
+        if self.ended or status not in ('downloading', 'finished', 'error'):
+            return
+        now = self.clock()
+        final = status != 'downloading'
+        if not final and self.started and (
+            not self.tty or self.last_update is not None and now - self.last_update < 0.2
+        ):
+            return
+        downloaded = self._number(event.get('downloaded_bytes'))
+        total = self._number(event.get('total_bytes'))
+        estimated = False
+        if total is None:
+            total = self._number(event.get('total_bytes_estimate'))
+            estimated = total is not None
+        speed = self._number(event.get('speed'))
+        eta = self._number(event.get('eta'))
+        if eta is None:
+            remaining = '?'
+        elif eta >= 86400:
+            remaining = f'{eta / 86400:.1f}d'
+        else:
+            minutes, seconds = divmod(int(eta), 60)
+            remaining = f'{minutes:02d}:{seconds:02d}'
+        label = {'downloading': 'Download', 'finished': 'Transfer complete', 'error': 'Transfer failed'}[status]
+        line = (f'{label}: {self._bytes(downloaded)} / '
+                f'{"~" if estimated else ""}{self._bytes(total)}'
+                f' | {self._bytes(speed)}/s | ETA {remaining}')
+        if self.tty:
+            columns = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns - 1)
+            line = line[:columns]
+            self.stream.write('\r' + line + ' ' * max(0, self.width - len(line)))
+            self.width = len(line)
+            if final:
+                self.stream.write('\n')
+                self.width = 0
+        else:
+            self.stream.write(line + '\n')
+        self.stream.flush()
+        self.last_update = now
+        self.started = True
+        self.ended = final
+
+    def close(self) -> None:
+        # Also terminate an in-place line when a transfer raises or is cancelled.
+        if self.width:
+            self.stream.write('\n')
+            self.stream.flush()
+            self.width = 0
+
+
 
 def _http_status(error: BaseException) -> int | None:
     pending = [error]
@@ -299,6 +381,7 @@ def _transfer(source: MediaSource, lecture: Lecture, session: requests.Session, 
     os.environ['YTDLP_NO_PLUGINS'] = '1'
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
+    progress = _DownloadProgress()
     options = {
         'continuedl': not restart, 'retries': 2, 'nopart': False,
         'http_chunk_size': 0, 'socket_timeout': 30,
@@ -311,7 +394,7 @@ def _transfer(source: MediaSource, lecture: Lecture, session: requests.Session, 
         'fixup': 'never', 'verbose': False, 'debug_printtraffic': False,
         'download_archive': None, 'external_downloader': None,
         'file_access_retries': 1, 'usenetrc': False, 'proxy': '',
-        'http_headers': {'User-Agent': USER_AGENT}, 'progress_hooks': [],
+        'http_headers': {'User-Agent': USER_AGENT}, 'progress_hooks': [progress],
     }
     try:
         with YoutubeDL(options, auto_init=False) as ydl:
@@ -328,6 +411,8 @@ def _transfer(source: MediaSource, lecture: Lecture, session: requests.Session, 
         raise DownloadFailure('下载未完成；可恢复的部分文件已保留。') from None
     except (OSError, requests.RequestException):
         raise DownloadFailure('下载传输或文件写入失败；部分文件已保留。') from None
+    finally:
+        progress.close()
 
 
 def _validate(work: Path, total: int | None) -> None:
