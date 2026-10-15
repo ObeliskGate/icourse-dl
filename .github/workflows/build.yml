@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'macOS'
         run: uv run --locked --no-dev --group build python scripts/package_frozen.py dist/executable/icourse-dl --platform "${{ runner.os }}" --arch "${{ runner.arch }}"
       - name: Upload isolated native package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: icourse-dl-${{ runner.os }}-${{ runner.arch }}
           path: dist/packages/icourse-dl-${{ runner.os }}-${{ runner.arch }}.*
