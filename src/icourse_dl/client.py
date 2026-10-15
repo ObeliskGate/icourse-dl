@@ -49,10 +49,10 @@ class MediaSource:
 
 def _id(value: object, error: type[Exception] = ConfigurationError) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
-        raise error("课程和课次 ID 必须是正十进制整数。")
+        raise error("课程和课次 ID 必须是正十进制整数.")
     normalized = value.lstrip("0")
     if not normalized:
-        raise error("课程和课次 ID 必须大于零。")
+        raise error("课程和课次 ID 必须大于零.")
     return normalized
 
 
@@ -78,14 +78,14 @@ def _lecture_date(title: str, year: str, month: str, day: str) -> str:
 
 def _mapping(value: object) -> dict:
     if not isinstance(value, dict):
-        raise ProtocolError("课程响应结构不兼容。")
+        raise ProtocolError("课程响应结构不兼容.")
     return value
 
 
 def _text(item: dict, key: str) -> str:
     value = item.get(key, "")
     if not isinstance(value, str):
-        raise ProtocolError("课次文本字段不兼容。")
+        raise ProtocolError("课次文本字段不兼容.")
     return value
 
 
@@ -131,7 +131,7 @@ def _media_parts(url: str):
                 raise ValueError
         return parts
     except ValueError:
-        raise ProtocolError("服务器返回不安全或无效的媒体地址。") from None
+        raise ProtocolError("服务器返回不安全或无效的媒体地址.") from None
 
 
 class ICourseClient:
@@ -147,17 +147,17 @@ class ICourseClient:
         )
         if response.status_code in (401, 403):
             Authenticator(self.session).probe_identity(self.identity.account)
-            raise PermissionDenied("当前账户无权访问该课程或课次。")
+            raise PermissionDenied("当前账户无权访问该课程或课次.")
         if not 200 <= response.status_code < 300:
-            raise ProtocolError("课程接口返回异常 HTTP 状态。")
+            raise ProtocolError("课程接口返回异常 HTTP 状态.")
         body = _mapping(parse_json(response))
         code = body.get("code")
         if isinstance(code, bool) or not isinstance(code, int):
-            raise ProtocolError("课程接口业务状态字段不兼容。")
+            raise ProtocolError("课程接口业务状态字段不兼容.")
         if code == 7001:
-            raise PermissionDenied("该课次尚未开放。")
+            raise PermissionDenied("该课次尚未开放.")
         if code != 0:
-            raise PermissionDenied("课程接口拒绝当前请求。")
+            raise PermissionDenied("课程接口拒绝当前请求.")
         _mapping(body.get("data"))
         return body
 
@@ -216,7 +216,7 @@ class ICourseClient:
             for month, days in _mapping(months).items():
                 for day, items in _mapping(days).items():
                     if not isinstance(items, list):
-                        raise ProtocolError("课次列表结构不兼容。")
+                        raise ProtocolError("课次列表结构不兼容.")
                     for item in items:
                         item = _mapping(item)
                         if "id" not in item:
@@ -233,7 +233,7 @@ class ICourseClient:
                             and str(item["playback_status"]) == "1",
                         )
                         if sub_id in lectures and lectures[sub_id] != lecture:
-                            raise ProtocolError("重复课次存在冲突字段。")
+                            raise ProtocolError("重复课次存在冲突字段.")
                         lectures[sub_id] = lecture
         return sorted(lectures.values(), key=lambda item: (item.date, len(item.sub_id), item.sub_id))
 
@@ -241,7 +241,7 @@ class ICourseClient:
         course_id, sub_id = _id(course_id), _id(sub_id)
         # Do not cache this authorization context across a signature refresh.
         if not any(item.sub_id == sub_id for item in self.get_lectures(course_id)):
-            raise PermissionDenied("该课次不属于所选课程。")
+            raise PermissionDenied("该课次不属于所选课程.")
         body = self._get("/courseapi/v3/portal-home-setting/get-sub-info",
                          course_id=course_id, sub_id=sub_id)
         data = body["data"]
@@ -270,7 +270,7 @@ class ICourseClient:
             elif isinstance(now, str) and re.fullmatch(r"[0-9]+", now):
                 timestamp = now.lstrip("0") or "0"
             else:
-                raise ProtocolError("媒体签名时间字段不兼容。")
+                raise ProtocolError("媒体签名时间字段不兼容.")
             identity = self.identity
             digest = hashlib.md5(
                 (parts.path + identity.user_id + identity.tenant_id
@@ -282,5 +282,5 @@ class ICourseClient:
             signed = urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
             return MediaSource(course_id, sub_id, vpn_url(signed))
         if unsupported:
-            raise PermissionDenied("当前媒体格式不支持：仅支持普通 MP4，不支持 HLS/DASH。")
-        raise PermissionDenied("该课次没有可下载的普通 MP4 视频。")
+            raise PermissionDenied("当前媒体格式不支持: 仅支持普通 MP4, 不支持 HLS/DASH.")
+        raise PermissionDenied("该课次没有可下载的普通 MP4 视频.")

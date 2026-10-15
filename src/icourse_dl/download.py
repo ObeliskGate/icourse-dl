@@ -59,7 +59,7 @@ def _regular(path: Path) -> bool:
     except FileNotFoundError:
         return False
     if not stat.S_ISREG(mode):
-        raise DownloadFailure('下载路径不是普通文件；拒绝符号链接或目录。')
+        raise DownloadFailure('下载路径不是普通文件; 拒绝符号链接或目录.')
     return True
 
 
@@ -99,14 +99,14 @@ def _url(url: str) -> None:
         p.scheme == 'https' and p.hostname == 'webvpn.fudan.edu.cn'
         or p.scheme == 'http' and local
     ):
-        raise DownloadFailure('媒体地址不符合安全传输要求。')
+        raise DownloadFailure('媒体地址不符合安全传输要求.')
 
 
 def _length(value: str | None) -> int | None:
     if value is None:
         return None
     if not re.fullmatch(r'[0-9]+', value):
-        raise DownloadFailure('媒体长度声明无效。')
+        raise DownloadFailure('媒体长度声明无效.')
     return int(value)
 
 def _media_cookies(session: requests.Session, url: str):
@@ -137,38 +137,38 @@ def _probe(session: requests.Session, url: str) -> MediaProbe:
                         target = urljoin(current, response.headers.get('Location', ''))
                         _url(target)
                         if not response.headers.get('Location') or urlsplit(target).netloc != urlsplit(current).netloc:
-                            raise DownloadFailure('媒体重定向目标不受信任。')
+                            raise DownloadFailure('媒体重定向目标不受信任.')
                         current = target
                         continue
                     if response.status_code in (401, 403):
                         raise _MediaDenied()
                     if response.status_code not in (200, 206):
-                        raise DownloadFailure('媒体服务器未返回可下载内容。')
+                        raise DownloadFailure('媒体服务器未返回可下载内容.')
                     content_type = response.headers.get('Content-Type', '').lower()
                     if 'html' in content_type or 'json' in content_type or response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
-                        raise DownloadFailure('媒体服务器返回了非 MP4 内容。')
+                        raise DownloadFailure('媒体服务器返回了非 MP4 内容.')
                     length = _length(response.headers.get('Content-Length'))
                     total = length
                     if response.status_code == 206:
                         match = re.fullmatch(r'bytes 0-([0-9]+)/([0-9]+)', response.headers.get('Content-Range', ''))
                         if not match:
-                            raise DownloadFailure('媒体 Content-Range 无效。')
+                            raise DownloadFailure('媒体 Content-Range 无效.')
                         end, total = map(int, match.groups())
                         if end >= total or end > 4095 or length is not None and length != end + 1:
-                            raise DownloadFailure('媒体长度声明互相矛盾。')
+                            raise DownloadFailure('媒体长度声明互相矛盾.')
                     elif response.headers.get('Content-Range'):
-                        raise DownloadFailure('媒体长度声明互相矛盾。')
+                        raise DownloadFailure('媒体长度声明互相矛盾.')
                     data = response.raw.read(4096, decode_content=False)
                     if not _head_valid(data):
-                        raise DownloadFailure('媒体头检查失败，不是可识别的 MP4。')
+                        raise DownloadFailure('媒体头检查失败, 不是可识别的 MP4.')
                     if length is not None and len(data) != min(length, 4096):
-                        raise DownloadFailure('媒体探测响应不完整。')
+                        raise DownloadFailure('媒体探测响应不完整.')
                     return MediaProbe(total)
             except requests.RequestException:
-                raise NetworkUnavailable('媒体网络暂不可达。') from None
+                raise NetworkUnavailable('媒体网络暂不可达.') from None
             except (OSError, UrllibHTTPError):
-                raise NetworkUnavailable('媒体网络读取失败。') from None
-    raise DownloadFailure('媒体重定向过多。')
+                raise NetworkUnavailable('媒体网络读取失败.') from None
+    raise DownloadFailure('媒体重定向过多.')
 
 
 @contextmanager
@@ -188,13 +188,13 @@ def _lock(path: Path):
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             except OSError:
-                raise DownloadFailure('该课次正在由另一个进程下载。') from None
+                raise DownloadFailure('该课次正在由另一个进程下载.') from None
         else:
             import fcntl
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                raise DownloadFailure('该课次正在由另一个进程下载。') from None
+                raise DownloadFailure('该课次正在由另一个进程下载.') from None
         locked = True
         yield
     finally:
@@ -408,32 +408,32 @@ def _transfer(source: MediaSource, lecture: Lecture, session: requests.Session, 
     except DownloadError as error:
         if _http_status(error) in (401, 403):
             raise _MediaDenied() from None
-        raise DownloadFailure('下载未完成；可恢复的部分文件已保留。') from None
+        raise DownloadFailure('下载未完成; 可恢复的部分文件已保留.') from None
     except (OSError, requests.RequestException):
-        raise DownloadFailure('下载传输或文件写入失败；部分文件已保留。') from None
+        raise DownloadFailure('下载传输或文件写入失败; 部分文件已保留.') from None
     finally:
         progress.close()
 
 
 def _validate(work: Path, total: int | None) -> None:
     if not _regular(work) or work.stat().st_size == 0:
-        raise DownloadFailure('下载器没有生成非空媒体文件。')
+        raise DownloadFailure('下载器没有生成非空媒体文件.')
     with work.open('rb') as stream:
         valid = _head_valid(stream.read(4096))
     if not valid:
         work.unlink()
-        raise DownloadFailure('下载结果不是 MP4；已移除无效工作文件。')
+        raise DownloadFailure('下载结果不是 MP4; 已移除无效工作文件.')
     if total is not None and work.stat().st_size != total:
-        raise DownloadFailure('下载结果长度不符；请使用 --restart 重新下载。')
+        raise DownloadFailure('下载结果长度不符; 请使用 --restart 重新下载.')
 
 
 def download_lecture(source: MediaSource, lecture: Lecture, session: requests.Session,
                      options: DownloadOptions, *, refresh_media: Callable[[], MediaSource]) -> Path:
     for value in (lecture.course_id, lecture.sub_id):
         if not re.fullmatch(r'[1-9][0-9]*', str(value)):
-            raise DownloadFailure('课次标识无效。')
+            raise DownloadFailure('课次标识无效.')
     if (source.course_id, source.sub_id) != (lecture.course_id, lecture.sub_id):
-        raise DownloadFailure('媒体与选定课次不一致。')
+        raise DownloadFailure('媒体与选定课次不一致.')
     date = lecture.date if re.fullmatch(r'\d{4}-\d{2}-\d{2}', lecture.date) else 'unknown-date'
     output = Path(options.output).absolute()
     final = output / f'{date}_{lecture.sub_id}_{_title(lecture.title)}.mp4'
@@ -445,53 +445,53 @@ def download_lecture(source: MediaSource, lecture: Lecture, session: requests.Se
     def fresh():
         nonlocal source, refreshed
         if refreshed:
-            raise PermissionDenied('媒体访问被拒绝，已停止刷新。')
+            raise PermissionDenied('媒体访问被拒绝, 已停止刷新.')
         refreshed = True
         source = refresh_media()
         if (source.course_id, source.sub_id) != (lecture.course_id, lecture.sub_id):
-            raise DownloadFailure('刷新后的媒体与课次不一致。')
+            raise DownloadFailure('刷新后的媒体与课次不一致.')
         _url(source.url)
 
     try:
         output.mkdir(parents=True, exist_ok=True)
         with _lock(Path(str(work) + '.lock')):
             if _regular(final) and final.stat().st_size > 0 and not options.overwrite:
-                _notice('跳过已有非空文件；未验证其完整性。')
+                _notice('跳过已有非空文件; 未验证其完整性.')
                 return final
             if final.exists() and not options.overwrite:
-                raise DownloadFailure('已有零字节目标；请明确使用 --overwrite。')
+                raise DownloadFailure('已有零字节目标; 请明确使用 --overwrite.')
             for path in (work, part):
                 if _regular(path) and options.restart:
                     path.unlink()
             mode = _preflight(output, options.overwrite)
             if mode == 'copy':
-                _notice('兼容保存，完成后需一次本地复制及额外空间；复制不具备崩溃原子性。')
+                _notice('兼容保存, 完成后需一次本地复制及额外空间; 复制不具备崩溃原子性.')
             while True:
                 try:
                     probe = _probe(session, source.url)
                     if known_total is not None and probe.total_size is not None and known_total != probe.total_size:
-                        raise DownloadFailure('媒体长度已改变；请使用 --restart。')
+                        raise DownloadFailure('媒体长度已改变; 请使用 --restart.')
                     if probe.total_size is not None:
                         known_total = probe.total_size
                         present = work.stat().st_size if work.exists() else part.stat().st_size if part.exists() else 0
                         required = max(0, known_total - present) + (known_total if mode == 'copy' else 0)
                         if shutil.disk_usage(output).free < required:
-                            raise DownloadFailure('保存目录剩余空间不足。')
+                            raise DownloadFailure('保存目录剩余空间不足.')
                     else:
-                        _notice('媒体总长度未知，无法预判完整容量。')
+                        _notice('媒体总长度未知, 无法预判完整容量.')
                     if not work.exists():
                         _transfer(source, lecture, session, work, options.restart and not refreshed)
                     _validate(work, known_total)
                     after = _probe(session, source.url)
                     if known_total is not None and after.total_size is not None and known_total != after.total_size:
-                        raise DownloadFailure('媒体长度已改变；请使用 --restart。')
+                        raise DownloadFailure('媒体长度已改变; 请使用 --restart.')
                     _validate(work, after.total_size if after.total_size is not None else known_total)
                     break
                 except _MediaDenied:
                     fresh()
             _commit(work, final, mode)
             if known_total is None:
-                _notice('下载正常结束，基本媒体检查通过；未做已知总长度校验。')
+                _notice('下载正常结束, 基本媒体检查通过; 未做已知总长度校验.')
             return final
     except OSError:
-        raise DownloadFailure('保存目录、锁或文件提交失败；已验证工作文件会保留。') from None
+        raise DownloadFailure('保存目录, 锁或文件提交失败; 已验证工作文件会保留.') from None
