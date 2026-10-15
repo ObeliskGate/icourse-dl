@@ -41,7 +41,8 @@ exe = EXE(
     analysis.scripts,
     analysis.binaries,
     analysis.datas,
-    [],
+    # Frozen Python ignores PYTHONUTF8; keep redirected Chinese output UTF-8.
+    [('X utf8=1', None, 'OPTION')],
     name="icourse-dl",
     debug=False,
     bootloader_ignore_signals=False,

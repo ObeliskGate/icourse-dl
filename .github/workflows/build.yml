@@ -19,8 +19,8 @@ jobs:
         # Separate native builds, not a macOS universal binary or cross-compilation.
         os: [windows-latest, macos-14, macos-15-intel]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: '3.12'
       - name: Install locked runtime and packaging dependencies

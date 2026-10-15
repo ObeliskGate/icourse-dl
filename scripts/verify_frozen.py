@@ -65,8 +65,6 @@ def isolated_environment(directory: Path) -> dict[str, str]:
         "TMP": str(directory),
         "TEMP": str(directory),
         "PYTHON_KEYRING_BACKEND": "keyring.backends.fail.Keyring",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     })
@@ -78,7 +76,8 @@ def smoke(executable: Path) -> None:
         directory = Path(temp)
         environment = isolated_environment(directory)
         cases = [
-            (arguments + ["--help"], 0, "usage: icourse-dl")
+            (arguments + ["--help"], 0,
+             "学年第一学期" if arguments == ["search"] else "usage: icourse-dl")
             for arguments in ([], ["login"], ["search"], ["search", "courses"],
                               ["search", "lectures"], ["download"])
         ]
@@ -101,7 +100,7 @@ def smoke(executable: Path) -> None:
             result = subprocess.run(
                 [str(executable), *arguments], cwd=directory, env=environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=90, check=False,
+                text=True, encoding="utf-8", errors="strict", timeout=90, check=False,
             )
             output = result.stdout + result.stderr
             if result.returncode != expected_code or expected_text not in output:
