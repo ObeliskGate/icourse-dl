@@ -11,8 +11,10 @@ from icourse_dl import credentials as storage
 
 
 SECRET = "synthetic-secret-must-not-appear"
-OLD = Credentials("synthetic-old", "old-" + SECRET, "prompt")
-NEW = Credentials("synthetic-new", "new-" + SECRET, "prompt")
+OLD_TOTP = "GEZDGNBVGY3TQOJQ"
+NEW_TOTP = "MZXW6YTBOI"
+OLD = Credentials("synthetic-old", "old-" + SECRET, "prompt", totp_secret=OLD_TOTP)
+NEW = Credentials("synthetic-new", "new-" + SECRET, "prompt", totp_secret=NEW_TOTP)
 KEY = (storage.SERVICE, storage.ACCOUNT_KEY)
 
 
@@ -76,6 +78,8 @@ def vault(monkeypatch):
 def assert_safe(exc):
     text = str(exc.value)
     assert SECRET not in text
+    assert OLD_TOTP not in text
+    assert NEW_TOTP not in text
     assert OLD.account not in text
     assert NEW.account not in text
     assert exc.value.exit_code == 6
@@ -88,18 +92,54 @@ def test_load_absent_is_read_only_and_tool_scoped(vault):
     assert backend.calls == [("get", KEY, None)]
 
 
-def test_round_trip_preserves_password_and_only_stores_one_secret(vault):
+def test_password_only_record_round_trip_remains_valid(vault):
     store, backend = vault
     credentials = Credentials("synthetic-account", "  密碼 \n" + SECRET, "prompt")
     store.save(credentials)
-    assert store.load() == Credentials(credentials.account, credentials.password, "keyring")
+    loaded = store.load()
+    assert loaded == Credentials(credentials.account, credentials.password, "keyring")
+    assert loaded.totp_secret is None
     assert set(backend.records) == {KEY}
-    assert json.loads(backend.records[KEY]) == {
-        "version": 1, "school": "fudan", "account": credentials.account,
-        "password": credentials.password,
-    }
     assert credentials.account not in storage.SERVICE + storage.ACCOUNT_KEY
 
+
+def test_totp_secret_round_trip_is_normalized_and_redacted(vault):
+    store, backend = vault
+    credentials = Credentials(
+        "synthetic-account", "synthetic-password", "prompt",
+        totp_secret=" \tjbswy3dpehpk3pxp \n",
+    )
+    store.save(credentials)
+    loaded = store.load()
+    assert loaded == Credentials(
+        credentials.account, credentials.password, "keyring",
+        totp_secret="JBSWY3DPEHPK3PXP",
+    )
+    assert "JBSWY3DPEHPK3PXP" not in repr(loaded)
+
+
+def test_load_normalizes_a_valid_stored_totp_secret(vault):
+    store, backend = vault
+    backend.records[KEY] = json.dumps({
+        "version": 1, "school": "fudan", "account": "a", "password": "p",
+        "totp_secret": "my======",
+    })
+    assert store.load().totp_secret == "MY"
+    assert [call[0] for call in backend.calls] == ["get"]
+
+
+def test_replacing_and_clearing_credentials_removes_totp_secret(vault):
+    store, backend = vault
+    seeded = Credentials("synthetic-account", "synthetic-password", "prompt",
+                         totp_secret=OLD_TOTP)
+    password_only = Credentials("synthetic-account", "replacement-password", "prompt")
+    store.save(seeded)
+    store.save(password_only)
+    assert "totp_secret" not in json.loads(backend.records[KEY])
+    assert store.load().totp_secret is None
+    store.save(seeded)
+    store.clear()
+    assert KEY not in backend.records
 
 @pytest.mark.parametrize("module,name", [
     ("keyring.backends.fail", "Keyring"),
@@ -152,7 +192,16 @@ def test_selection_failure_is_safe_and_explains_linux_wsl(monkeypatch):
     json.dumps({"version": 1, "school": "fudan", "account": "", "password": SECRET}),
     json.dumps({"version": 1, "school": "fudan", "account": "a", "password": None}),
     json.dumps({"version": 1, "school": "fudan", "account": "a", "password": ""}),
-    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": SECRET, "extra": 1}),
+    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": SECRET,
+                "extra": 1}),
+    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": "p",
+                "totp_secret": None}),
+    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": "p",
+                "totp_secret": 17}),
+    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": "p",
+                "totp_secret": ""}),
+    json.dumps({"version": 1, "school": "fudan", "account": "a", "password": "p",
+                "totp_secret": "JBSWY3DPEHPK3PX!"}),
     '{"version":1,"version":1,"school":"fudan","account":"a","password":"p"}',
     "x" * (storage.MAX_RECORD_BYTES + 1),
     '{"version":1,"school":"fudan","account":"a","password":"\\ud800"}',
@@ -168,6 +217,29 @@ def test_corruption_is_safe_read_only_and_not_overwritten(vault, raw):
         store.save(NEW)
     assert backend.records[KEY] == raw
     assert all(call[0] == "get" for call in backend.calls)
+
+
+def test_malformed_totp_secret_is_rejected_before_store_access(vault):
+    store, backend = vault
+    malformed = "JBSWY3DPEHPK3PX!"
+    with pytest.raises(storage.StorageFailure) as exc:
+        store.save(Credentials("a", "p", "prompt", totp_secret=malformed))
+    assert_safe(exc)
+    assert malformed not in str(exc.value)
+    assert not backend.calls
+
+
+def test_windows_byte_capacity_includes_totp_secret(vault):
+    store, backend = vault
+    password = "p" * 1200
+    plain = Credentials("a", password, "prompt")
+    seeded = Credentials("a", password, "prompt", totp_secret=OLD_TOTP)
+    assert len(storage._record(plain).encode("utf-16-le")) <= storage.WINDOWS_MAX_BYTES
+    assert len(storage._record(seeded).encode("utf-16-le")) > storage.WINDOWS_MAX_BYTES
+    with pytest.raises(storage.StorageFailure) as exc:
+        store.save(seeded)
+    assert "byte capacity" in str(exc.value)
+    assert not backend.calls
 
 
 def test_encoded_record_size_is_bounded(vault):
@@ -356,7 +428,7 @@ def test_macos_uses_native_password_methods(monkeypatch):
     backend = Keyring()
     store = select(monkeypatch, backend, platform="darwin", module=SimpleNamespace(Keyring=Keyring))
     store.save(NEW)
-    assert store.load() == Credentials(NEW.account, NEW.password, "keyring")
+    assert store.load() == Credentials(NEW.account, NEW.password, "keyring", NEW.totp_secret)
     store.clear()
     assert not backend.records
 
@@ -414,7 +486,7 @@ def test_secretservice_never_creates_collections_or_enumerates(monkeypatch):
     assert store.load() is None
     assert not records
     store.save(NEW)
-    assert store.load() == Credentials(NEW.account, NEW.password, "keyring")
+    assert store.load() == Credentials(NEW.account, NEW.password, "keyring", NEW.totp_secret)
     store.clear()
     assert not records
     assert all(query == {"service": KEY[0], "username": KEY[1]} for query in searches)
@@ -485,7 +557,7 @@ def test_kwallet_avoids_legacy_migration_and_checks_native_return_codes(monkeypa
     assert store.load() is None
     assert not records and not folders
     store.save(OLD)
-    assert store.load() == Credentials(OLD.account, OLD.password, "keyring")
+    assert store.load() == Credentials(OLD.account, OLD.password, "keyring", OLD.totp_secret)
     wallet.write_result = -1
     with pytest.raises(storage.StorageFailure) as exc:
         store.save(NEW)
@@ -510,7 +582,7 @@ def test_no_plaintext_file_writes_or_fallback(vault, monkeypatch):
         context.setattr("io.open", forbid_file)
         store.check_writable()
         store.save(OLD)
-        assert store.load() == Credentials(OLD.account, OLD.password, "keyring")
+        assert store.load() == Credentials(OLD.account, OLD.password, "keyring", OLD.totp_secret)
         backend.actions["set"].append(RuntimeError(SECRET))
         with pytest.raises(storage.StorageFailure):
             store.save(NEW)

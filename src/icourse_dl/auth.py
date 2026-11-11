@@ -30,6 +30,7 @@ from dotenv import dotenv_values
 import requests
 
 from .errors import AuthenticationError, ConfigurationError, NetworkUnavailable, ProtocolError
+from .totp import generate_code, normalize_secret
 
 WEBVPN = "https://webvpn.fudan.edu.cn"
 IDP = "https://id.fudan.edu.cn"
@@ -52,7 +53,7 @@ class Credentials:
     account: str
     password: str = field(repr=False)
     source: Literal["env", "keyring", "prompt"]
-
+    totp_secret: str | None = field(default=None, repr=False)
 
 @dataclass(frozen=True)
 class Identity:
@@ -96,7 +97,13 @@ def load_env_config(path: Path) -> ExplicitConfig:
     account, password = values.get("StuId"), values.get("UISPsw")
     if not isinstance(account, str) or not account.strip() or not isinstance(password, str) or password == "":
         raise ConfigurationError("The explicit file must contain both StuId and UISPsw.")
-    return ExplicitConfig(Credentials(account.strip(), password, "env"), values.get("COURSE_ID"))
+    totp_secret = None
+    if "UIS_TOTP_SECRET" in values:
+        value = values["UIS_TOTP_SECRET"]
+        if not isinstance(value, str):
+            raise ConfigurationError("The TOTP secret must be a nonempty Base32 value.")
+        totp_secret = normalize_secret(value)
+    return ExplicitConfig(Credentials(account.strip(), password, "env", totp_secret), values.get("COURSE_ID"))
 
 
 def prompt_credentials(expected_account: str | None = None) -> Credentials:
@@ -109,11 +116,13 @@ def prompt_credentials(expected_account: str | None = None) -> Credentials:
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
             password = getpass.getpass("Password: ")
+            raw_totp_secret = getpass.getpass("TOTP Base32 secret (not a six-digit code; blank if not required): ")
     except (getpass.GetPassWarning, EOFError, OSError):
-        raise ConfigurationError("Hidden password input is unavailable.") from None
+        raise ConfigurationError("Hidden credential input is unavailable.") from None
     if password == "":
         raise ConfigurationError("The password must not be empty.")
-    return Credentials(account, password, "prompt")
+    totp_secret = normalize_secret(raw_totp_secret) if raw_totp_secret else None
+    return Credentials(account, password, "prompt", totp_secret)
 
 
 def _url_parts(url: str):
@@ -366,6 +375,27 @@ class SafeHTTP:
         return parse_json(response)
 
 
+class SecondFactorError(AuthenticationError):
+    """A second-factor challenge needs user action and cannot be retried safely."""
+
+
+_TOTP_SETUP_MESSAGE = (
+    "Second-factor setup is required. Run login with the selected account to add or check its TOTP secret."
+)
+_TOTP_REJECTED_MESSAGE = (
+    "TOTP authentication was not accepted. Check the account's bound secret and system clock, then run login."
+)
+_TOTP_INCOMPLETE_MESSAGE = (
+    "TOTP authentication did not complete. Additional or incompatible verification is not supported here."
+)
+_TOTP_UNSUPPORTED_MESSAGE = (
+    "The server did not offer TOTP. This tool cannot complete other second-factor methods."
+)
+_TOTP_ACCOUNT_MESSAGE = (
+    "The second-factor challenge does not match the selected account. Check the account selection and run login again."
+)
+
+
 class _Unauthenticated(AuthenticationError):
     """Explicitly logged out, distinct from an authenticated account mismatch."""
 
@@ -447,6 +477,7 @@ class Authenticator:
         self.http = SafeHTTP(session, sleep=sleep, clock=clock)
         self.round = 0
         self._stage = "identity-probe"
+        self._second_factor_observed = False
 
     @property
     def stage(self) -> str:
@@ -500,6 +531,59 @@ class Authenticator:
                 raise
             raise _UncertainAuthentication(exc) from None
 
+    def _authenticate_totp(self, challenge: dict, credentials: Credentials, *,
+                           lck: str, entity: str, request_type: str,
+                           headers: dict[str, str], encode: Callable[[str], str],
+                           proxied: bool) -> str:
+        module_codes = challenge.get("moduleCodes")
+        if (not isinstance(module_codes, list)
+                or not all(isinstance(code, str) for code in module_codes)):
+            raise SecondFactorError(_TOTP_SETUP_MESSAGE)
+        if "userAndOtp" not in module_codes:
+            raise SecondFactorError(_TOTP_UNSUPPORTED_MESSAGE)
+        chain = challenge.get("authChainCode")
+        request_number = challenge.get("requestNumber")
+        if not isinstance(chain, str) or not chain.strip():
+            raise SecondFactorError(_TOTP_SETUP_MESSAGE)
+        if not (isinstance(request_number, str) and request_number.strip()
+                or isinstance(request_number, int) and not isinstance(request_number, bool)):
+            raise SecondFactorError(_TOTP_SETUP_MESSAGE)
+        if "userName" in challenge:
+            user_name = challenge["userName"]
+            if not isinstance(user_name, str) or not user_name.strip() or user_name != credentials.account:
+                raise SecondFactorError(_TOTP_ACCOUNT_MESSAGE)
+        secret = credentials.totp_secret
+        if not isinstance(secret, str) or not secret:
+            raise SecondFactorError(_TOTP_SETUP_MESSAGE)
+        try:
+            code = generate_code(secret)
+        except ConfigurationError:
+            raise SecondFactorError(_TOTP_SETUP_MESSAGE) from None
+
+        self.stage = ("icourse" if proxied else "webvpn") + ":totp-submit"
+        executed = self._side_effect("POST", encode(IDP + "/idp/authn/authExecute"),
+            headers=headers, proxy_redirects=proxied,
+            json={"authModuleCode": "userAndOtp", "authChainCode": chain,
+                  "entityId": entity, "requestNumber": request_number,
+                  "requestType": request_type, "lck": lck,
+                  "authPara": {"loginName": credentials.account, "otpCode": code}})
+        if 400 <= executed.status_code < 500:
+            raise SecondFactorError(_TOTP_REJECTED_MESSAGE)
+        _require_success(executed)
+        try:
+            result = parse_json(executed)
+        except ProtocolError:
+            raise SecondFactorError(_TOTP_INCOMPLETE_MESSAGE) from None
+        result_code = result.get("code")
+        if result_code not in (200, "200") or isinstance(result_code, bool):
+            raise SecondFactorError(_TOTP_REJECTED_MESSAGE)
+        if result.get("second"):
+            raise SecondFactorError(_TOTP_INCOMPLETE_MESSAGE)
+        token = result.get("loginToken")
+        if not isinstance(token, str) or not token.strip():
+            raise SecondFactorError(_TOTP_INCOMPLETE_MESSAGE)
+        return token
+
     def _authenticate_stage(self, credentials: Credentials, lck: str, *, proxied: bool) -> None:
         entity = ICOURSE if proxied else WEBVPN
         encode = vpn_url if proxied else lambda value: value
@@ -538,7 +622,14 @@ class Authenticator:
         result = parse_json(executed)
         if result.get("code") not in (200, "200") or isinstance(result.get("code"), bool):
             raise AuthenticationError("Authentication was refused; check credentials or complete any challenge locally.")
-        token = _nonempty(result.get("loginToken"))
+        if result.get("second"):
+            self._second_factor_observed = True
+            token = self._authenticate_totp(
+                result, credentials, lck=lck, entity=entity,
+                request_type=request_type, headers=headers, encode=encode,
+                proxied=proxied)
+        else:
+            token = _nonempty(result.get("loginToken"))
         self.stage = ("icourse" if proxied else "webvpn") + ":ticket-exchange"
         engine = self._side_effect("POST", encode(IDP + "/idp/authCenter/authnEngine"),
             data={"loginToken": token}, headers=headers, follow_redirects=False)
@@ -597,11 +688,14 @@ class Authenticator:
         round re-enters the entry/context chain; password bodies and tickets
         from an interrupted round are never replayed. An ambiguous write is
         first checked by the normal three-attempt read-only identity probe.
+        Once a second-factor challenge is observed, failures stop without
+        restarting authentication or replaying the OTP submission.
         One monotonic five-minute budget covers rounds, reads and waits;
         socket timeouts shrink near its end and streamed chunks check it too.
         """
         if not credentials.account or credentials.password == "":
             raise ConfigurationError("Complete credentials are required.")
+        self._second_factor_observed = False
         self.http.deadline = self.http.clock() + AUTH_BUDGET
         authenticated = False
         try:
@@ -611,6 +705,10 @@ class Authenticator:
                 try:
                     identity = self._login_round(credentials)
                 except NetworkUnavailable as exc:
+                    if self._second_factor_observed:
+                        failure = self._network_failure(exc, self.stage)
+                        failure.retryable = False
+                        raise failure from None
                     failure, failed_stage = exc, self.stage
                 except (ProtocolError, AuthenticationError) as exc:
                     raise type(exc)(f"Authentication round={self.round} stage={self.stage}: {exc}") from None

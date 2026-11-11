@@ -8,7 +8,10 @@ import requests
 from icourse_dl.auth import Authenticator, Credentials, IDP, WEBVPN
 from icourse_dl.client import ICourseClient
 from icourse_dl.errors import AuthenticationError, NetworkUnavailable, ProtocolError
-from test_auth import FakeResponse, FakeSession, identity_response, make_login_fixture
+from icourse_dl.totp import generate_code
+from test_auth import (
+    FakeResponse, FakeSession, add_totp_challenge, identity_response, make_login_fixture,
+)
 
 
 CREDENTIALS = Credentials("student-test", "FAKE_PASSWORD", "prompt")
@@ -80,6 +83,49 @@ def test_ambiguous_write_uses_three_read_attempts_without_replay(step, caplog):
     assert sum("infosimple" in url for _, url, _ in session.calls) == 3
     assert "verification=confirmed" in caplog.text
     assert "timeout" in caplog.text and "FAKE_" not in caplog.text
+
+
+@pytest.mark.parametrize(("failure_index", "failure_kind"), [
+    (5, "read-timeout"),
+    (5, "transient-http"),
+    (6, "connection"),
+    (7, "tls"),
+])
+def test_totp_and_later_ticket_failures_never_replay(failure_index, failure_kind, monkeypatch, caplog):
+    _, session = make_login_fixture(sso=True)
+    add_totp_challenge(session)
+    secret = "JBSWY3DPEHPK3PXP"
+    monkeypatch.setattr("icourse_dl.totp.time.time", lambda: 60.0)
+    code = generate_code(secret)
+    if failure_kind == "read-timeout":
+        failure = requests.ReadTimeout(f"FAKE_SECRET {code}")
+    elif failure_kind == "transient-http":
+        failure = FakeResponse(status=503)
+    elif failure_kind == "connection":
+        failure = requests.ConnectionError(f"FAKE_SECRET {code}")
+    else:
+        failure = requests.exceptions.SSLError(f"FAKE_SECRET {code}")
+    session.responses[failure_index] = failure
+    credentials = Credentials("student-test", "FAKE_PASSWORD", "prompt", secret)
+    clock = FakeClock()
+    caplog.set_level(logging.INFO, logger="icourse_dl.auth")
+    with pytest.raises(NetworkUnavailable) as caught:
+        Authenticator(session, clock=clock, sleep=clock.sleep).login(credentials)
+
+    assert len(session.calls) == failure_index + 1
+    assert clock.sleeps == []
+    assert not caught.value.retryable
+    assert sum((kwargs.get("json") or {}).get("authModuleCode") == "userAndPwd"
+               for _, _, kwargs in session.calls) == 1
+    assert sum((kwargs.get("json") or {}).get("authModuleCode") == "userAndOtp"
+               for _, _, kwargs in session.calls) == 1
+    assert not any("infosimple" in url for _, url, _ in session.calls)
+    diagnostic = str(caught.value) + caplog.text
+    assert "FAKE_SECRET" not in diagnostic and "FAKE_PASSWORD" not in diagnostic
+    assert code not in diagnostic
+
+
+
 
 
 @pytest.mark.parametrize("probe", [

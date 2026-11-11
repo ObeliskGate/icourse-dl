@@ -29,7 +29,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--verbose', action='store_true', default=argparse.SUPPRESS,
                         help='Show sanitized authentication stages and diagnostic details; never log credentials or tickets.')
     parser.add_argument('--env', type=Path, nargs='?', const=Path('.env'), default=argparse.SUPPRESS,
-                        help='Override credentials for this invocation: --env uses ./.env; --env PATH uses that file. Only login saves credentials.')
+                        help='Override credentials for this invocation: --env uses ./.env; --env PATH uses that file. Optional UIS_TOTP_SECRET supplies the Base32 second-factor secret. Only login saves credentials.')
 
 
 def parser() -> argparse.ArgumentParser:
@@ -38,7 +38,7 @@ def parser() -> argparse.ArgumentParser:
     _common(root)
     commands = root.add_subparsers(dest='action', required=True, title='commands')
     login = commands.add_parser('login', help='Verify and save default credentials, or clear them.',
-                                description='Verify school credentials and save them to a supported system keyring. No cookies are persisted. An unavailable or locked backend is an error; there is no plaintext fallback.')
+                                description='Verify school credentials and save them to a supported system keyring. Interactive login also asks for an optional Base32 TOTP secret, not a current six-digit code; leave it blank only for password-only accounts. A saved secret enables automatic second-factor authentication for search/download. No cookies are persisted. An unavailable or locked backend is an error; there is no plaintext fallback.')
     _common(login)
     login.add_argument('--clear', action='store_true', help='Delete only this tool\'s saved credentials, without contacting the school or deleting .env.')
     search = commands.add_parser('search', help='Query courses or lectures; never download.',
@@ -263,6 +263,10 @@ class _RetryFormatter(logging.Formatter):
 
 
 def _error_message(error: ICourseError, verbose: bool) -> str:
+    if isinstance(error, AuthenticationError):
+        from .auth import SecondFactorError
+        if isinstance(error, SecondFactorError):
+            return str(error)
     if verbose or not str(error).startswith('Authentication '):
         return str(error)
     if isinstance(error, NetworkUnavailable):

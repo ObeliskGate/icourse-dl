@@ -15,10 +15,11 @@ import requests
 
 from icourse_dl.auth import (
     AUTH_LIMIT, ICOURSE, IDP, WEBVPN, Authenticator, Credentials,
-    Identity, SafeHTTP, load_env_config, prompt_credentials,
+    Identity, SafeHTTP, SecondFactorError, load_env_config, prompt_credentials,
     validate_official_url, vpn_url,
 )
 from icourse_dl.errors import AuthenticationError, ConfigurationError, NetworkUnavailable, ProtocolError
+from icourse_dl.totp import generate_code
 
 
 class FakeResponse:
@@ -92,6 +93,25 @@ def make_login_fixture(*, sso=False):
     return key, FakeSession(responses)
 
 
+def totp_challenge(**changes):
+    challenge = {
+        "code": 200,
+        "second": True,
+        "moduleCodes": ["userAndOtp"],
+        "authChainCode": "otp-chain-test",
+        "requestNumber": "request-test",
+        "userName": "student-test",
+    }
+    challenge.update(changes)
+    return FakeResponse(challenge)
+
+
+def add_totp_challenge(session, index=4, *, challenge=None, response=None):
+    session.responses[index] = challenge or totp_challenge()
+    session.responses.insert(
+        index + 1, response or FakeResponse({"code": 200, "loginToken": "otp-stage-token"}))
+
+
 def test_complete_two_stage_login_and_rsa():
     key, session = make_login_fixture()
     credentials = Credentials("student-test", " 空 格 ! ", "env")
@@ -118,6 +138,116 @@ def test_valid_sso_avoids_second_password_submission():
     assert sum("authExecute" in url for _, url, _ in session.calls) == 1
 
 
+@pytest.mark.parametrize(("challenge_index", "entity", "lck", "origin", "request_number"), [
+    (4, WEBVPN, "vpn-context", IDP, "request-test"),
+    (11, ICOURSE, "course-context", WEBVPN, 42),
+])
+def test_totp_continues_direct_and_proxied_authenticate_protocol(
+        monkeypatch, challenge_index, entity, lck, origin, request_number):
+    _, session = make_login_fixture()
+    request_type = "original-request-type"
+    query_index = 2 if challenge_index == 4 else 9
+    session.responses[query_index] = FakeResponse({
+        "data": [{"moduleCode": "userAndPwd", "authChainCode": "chain-test"}],
+        "requestType": request_type,
+    })
+    challenge = totp_challenge(requestNumber=request_number, loginToken="password-stage-token")
+    add_totp_challenge(session, challenge_index, challenge=challenge)
+    secret = "JBSWY3DPEHPK3PXP"
+    monkeypatch.setattr("icourse_dl.totp.time.time", lambda: 60.0)
+    expected_code = generate_code(secret)
+    requested_secrets = []
+    monkeypatch.setattr(
+        "icourse_dl.auth.generate_code",
+        lambda value: requested_secrets.append(value) or generate_code(value),
+    )
+    credentials = Credentials("student-test", "pw", "keyring", secret)
+    identity = Authenticator(session).login(credentials)
+
+    assert identity == Identity("student-test", "7", "222", "13800000000")
+    assert not session.responses
+    assert requested_secrets == [secret]
+    assert secret not in repr(credentials)
+    executions = [
+        (url, kwargs) for _, url, kwargs in session.calls
+        if "/authExecute" in url
+    ]
+    otp_url, otp_kwargs = next(
+        (url, kwargs) for url, kwargs in executions
+        if kwargs["json"]["authModuleCode"] == "userAndOtp"
+    )
+    payload = otp_kwargs["json"]
+    assert len(executions) == 3
+    assert payload == {
+        "authModuleCode": "userAndOtp",
+        "authChainCode": "otp-chain-test",
+        "entityId": entity,
+        "requestNumber": request_number,
+        "requestType": request_type,
+        "lck": lck,
+        "authPara": {"loginName": "student-test", "otpCode": expected_code},
+    }
+    assert otp_kwargs["headers"]["Origin"] == origin
+    assert validate_official_url(otp_url) == IDP + "/idp/authn/authExecute"
+    engine = [kwargs["data"] for _, url, kwargs in session.calls if "authnEngine" in url]
+    engine_index = 0 if challenge_index == 4 else 1
+    assert engine[engine_index]["loginToken"] == "otp-stage-token"
+
+
+@pytest.mark.parametrize(("challenge", "secret"), [
+    ({"moduleCodes": ["userAndSms"]}, "JBSWY3DPEHPK3PXP"),
+    ({"moduleCodes": ["userAndOtp", 7]}, "JBSWY3DPEHPK3PXP"),
+    ({"authChainCode": ""}, "JBSWY3DPEHPK3PXP"),
+    ({"requestNumber": True}, "JBSWY3DPEHPK3PXP"),
+    ({"requestNumber": "  "}, "JBSWY3DPEHPK3PXP"),
+    ({"userName": "other-account"}, "JBSWY3DPEHPK3PXP"),
+    ({"userName": ""}, "JBSWY3DPEHPK3PXP"),
+    ({}, None),
+])
+def test_invalid_totp_challenge_stops_before_otp(challenge, secret, monkeypatch):
+    _, session = make_login_fixture(sso=True)
+    generated = []
+    monkeypatch.setattr(
+        "icourse_dl.auth.generate_code",
+        lambda value: generated.append(value) or generate_code(value),
+    )
+    session.responses[4] = totp_challenge(**challenge)
+    with pytest.raises(SecondFactorError):
+        Authenticator(session).login(Credentials("student-test", "pw", "env", secret))
+    assert len(session.calls) == 5
+    assert sum((kwargs.get("json") or {}).get("authModuleCode") == "userAndOtp"
+               for _, _, kwargs in session.calls) == 0
+    assert generated == []
+
+
+@pytest.mark.parametrize("otp_response", [
+    FakeResponse(status=400),
+    FakeResponse(status=403),
+    FakeResponse(body=b"{"),
+    FakeResponse({"code": 401, "message": "SYNTHETIC_SECRET"}),
+    FakeResponse({"code": True, "loginToken": "SYNTHETIC_SECRET"}),
+    FakeResponse({"code": 200}),
+    FakeResponse({"code": 200, "loginToken": "  "}),
+    FakeResponse({"code": 200, "second": True, "loginToken": "SYNTHETIC_SECRET"}),
+])
+def test_totp_response_failures_are_sanitized(otp_response, caplog, monkeypatch):
+    _, session = make_login_fixture(sso=True)
+    monkeypatch.setattr("icourse_dl.totp.time.time", lambda: 60.0)
+    secret = "JBSWY3DPEHPK3PXP"
+    code = generate_code(secret)
+    add_totp_challenge(session, response=otp_response)
+    with pytest.raises(SecondFactorError) as caught:
+        Authenticator(session).login(Credentials("student-test", "pw", "env", secret))
+    diagnostic = str(caught.value) + caplog.text
+    assert "SYNTHETIC_SECRET" not in diagnostic
+    assert code not in diagnostic
+    assert len(session.calls) == 6
+    assert not any("authnEngine" in url for _, url, _ in session.calls)
+    assert sum((kwargs.get("json") or {}).get("authModuleCode") == "userAndOtp"
+               for _, _, kwargs in session.calls) == 1
+
+
+
 def test_env_bom_unicode_password_spaces_no_interpolation(tmp_path, monkeypatch):
     path = tmp_path / "中文.env"
     contents = '\ufeffStuId=" student-test "\nUISPsw=" 空 格 ${SECRET} "\nCOURSE_ID=00123\n'
@@ -130,6 +260,26 @@ def test_env_bom_unicode_password_spaces_no_interpolation(tmp_path, monkeypatch)
     assert config.course_id_text == "00123"
     assert path.read_bytes() == before_bytes and dict(os.environ) == before
     assert "空 格" not in repr(config)
+
+
+def test_env_totp_secret_is_explicit_only_and_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("UIS_TOTP_SECRET", "PROCESS-SECRET")
+    path = tmp_path / "selected.env"
+    path.write_text('StuId=student-test\nUISPsw=pw\nUIS_TOTP_SECRET=" m y====== "\n')
+    credentials = load_env_config(path).credentials
+    assert credentials.totp_secret == "MY"
+    assert "MY" not in repr(credentials)
+    path.write_text("StuId=student-test\nUISPsw=pw\n")
+    assert load_env_config(path).credentials.totp_secret is None
+    path.write_text("StuId=student-test\nUISPsw=pw\nUIS_TOTP_SECRET=${SECRET}\n")
+    monkeypatch.setenv("SECRET", "JBSWY3DPEHPK3PXP")
+    with pytest.raises(ConfigurationError):
+        load_env_config(path)
+    path.write_text("StuId=student-test\nUISPsw=pw\nUIS_TOTP_SECRET=\n")
+    with pytest.raises(ConfigurationError):
+        load_env_config(path)
+
+
 
 
 @pytest.mark.parametrize("contents", ["StuId=x", "UISPsw=x", "StuId=\nUISPsw=x", "StuId=x\nUISPsw=", "StuId='x\nUISPsw=secret", "StuId=x\nUISPsw=y\ninvalid line here"])
@@ -196,6 +346,73 @@ def test_prompt_requires_complete_selected_account(monkeypatch):
         with pytest.raises(ConfigurationError):
             prompt_credentials("student-test")
     hidden.assert_not_called()
+@pytest.mark.parametrize(("raw_secret", "normalized"), [
+    ("jbswy3dp ehpk3pxp", "JBSWY3DPEHPK3PXP"),
+    ("", None),
+])
+def test_prompt_reads_hidden_totp_and_blank_is_optional(monkeypatch, raw_secret, normalized):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "student-test")
+    prompts = []
+    answers = iter(["pw", raw_secret])
+
+    def hidden(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("getpass.getpass", hidden)
+    credentials = prompt_credentials("student-test")
+    assert credentials.totp_secret == normalized
+    if normalized is not None:
+        assert normalized not in repr(credentials)
+
+
+def test_prompt_totp_cancel_and_hidden_failure_are_sanitized(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "student-test")
+    answers = iter(["pw", EOFError()])
+
+    def hidden(_):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr("getpass.getpass", hidden)
+    with pytest.raises(ConfigurationError) as caught:
+        prompt_credentials("student-test")
+    assert "pw" not in str(caught.value)
+
+
+def test_totp_prompt_interrupt_preserves_cancellation(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "student-test")
+    with patch("getpass.getpass", side_effect=["pw", KeyboardInterrupt()]):
+        with pytest.raises(KeyboardInterrupt):
+            prompt_credentials("student-test")
+
+def test_totp_prompt_warning_never_falls_back_to_echo(monkeypatch):
+    import warnings
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "student-test")
+    prompts = []
+
+    def hidden(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return "pw"
+        warnings.warn("secret", getpass.GetPassWarning)
+        pytest.fail("TOTP input must not fall back to echoed input")
+
+    monkeypatch.setattr("getpass.getpass", hidden)
+    with pytest.raises(ConfigurationError):
+        prompt_credentials("student-test")
+
 
 
 def test_vpn_url_roundtrip_and_port():

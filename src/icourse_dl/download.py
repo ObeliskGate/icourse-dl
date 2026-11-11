@@ -482,10 +482,6 @@ def download_lecture(source: MediaSource, lecture: Lecture, session: requests.Se
                     if not work.exists():
                         _transfer(source, lecture, session, work, options.restart and not refreshed)
                     _validate(work, known_total)
-                    after = _probe(session, source.url)
-                    if known_total is not None and after.total_size is not None and known_total != after.total_size:
-                        raise DownloadFailure('媒体长度已改变; 请使用 --restart.')
-                    _validate(work, after.total_size if after.total_size is not None else known_total)
                     break
                 except _MediaDenied:
                     fresh()

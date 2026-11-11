@@ -18,8 +18,9 @@ def test_local_env_ignored_for_interactive_login(tmp_path, contents):
     def authenticate(self, credentials):
         assert credentials.account == 'typed-user'
         assert credentials.password == ' typed-password '
+        assert credentials.totp_secret is None
         return auth.Identity('typed-user', '1', '222', '')
-    with patch('sys.stdin.isatty', return_value=True), patch('sys.stderr.isatty', return_value=True), patch('builtins.input', return_value='typed-user'), patch('getpass.getpass', return_value=' typed-password '), patch.object(auth.Authenticator, 'login', authenticate):
+    with patch('sys.stdin.isatty', return_value=True), patch('sys.stderr.isatty', return_value=True), patch('builtins.input', return_value='typed-user'), patch('getpass.getpass', side_effect=[' typed-password ', '']), patch.object(auth.Authenticator, 'login', authenticate):
         assert main(['login']) == 0
     assert path.read_text(encoding='utf-8') == contents
 

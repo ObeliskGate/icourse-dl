@@ -89,12 +89,19 @@ def test_preflight_fallback(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_length_change(tmp_path):
-    with server() as (url, _), patch.object(d, '_probe', side_effect=[d.MediaProbe(len(MEDIA)), d.MediaProbe(len(MEDIA) + 1)]):
-        with pytest.raises(DownloadFailure, match='改变'):
+def test_download_length_mismatch(tmp_path):
+    with server() as (url, _), patch.object(d, '_probe', return_value=d.MediaProbe(len(MEDIA) + 1)):
+        with pytest.raises(DownloadFailure, match='长度不符'):
             run_one(url, tmp_path)
     assert (tmp_path / '.icourse-dl-11-22.work.mp4').exists()
     assert not list(tmp_path.glob('2026*.mp4'))
+
+
+def test_completed_download_survives_later_media_denial(tmp_path):
+    with server() as (url, _), patch.object(
+        d, '_probe', side_effect=[d.MediaProbe(len(MEDIA)), d._MediaDenied()]
+    ):
+        verify(run_one(url, tmp_path))
 
 
 def test_denied_refresh_once(tmp_path):

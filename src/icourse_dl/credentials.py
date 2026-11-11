@@ -15,7 +15,8 @@ import sys
 import keyring
 
 from .auth import Credentials
-from .errors import ICourseError
+from .errors import ConfigurationError, ICourseError
+from .totp import normalize_secret
 
 
 SERVICE = "icourse-dl.credentials"
@@ -48,11 +49,13 @@ class StorageFailure(ICourseError):
 
 
 def _record(credentials: Credentials) -> str:
-    raw = json.dumps(
-        {"version": 1, "school": "fudan", "account": credentials.account,
-         "password": credentials.password},
-        ensure_ascii=False, separators=(",", ":"),
-    )
+    record = {
+        "version": 1, "school": "fudan", "account": credentials.account,
+        "password": credentials.password,
+    }
+    if credentials.totp_secret is not None:
+        record["totp_secret"] = normalize_secret(credentials.totp_secret)
+    raw = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     _decode(raw)
     return raw
 
@@ -73,9 +76,10 @@ def _decode(raw: str) -> Credentials:
         if len(raw.encode("utf-8")) > MAX_RECORD_BYTES:
             raise ValueError
         record = json.loads(raw, object_pairs_hook=_unique_object)
-        if type(record) is not dict or set(record) != {
-            "version", "school", "account", "password"
-        }:
+        required = {"version", "school", "account", "password"}
+        if type(record) is not dict or set(record) not in (
+            required, required | {"totp_secret"}
+        ):
             raise ValueError
         if type(record["version"]) is not int or record["version"] != 1:
             raise ValueError
@@ -87,8 +91,13 @@ def _decode(raw: str) -> Credentials:
             raise ValueError
         account.encode("utf-8")
         password.encode("utf-8")
-        return Credentials(account, password, "keyring")
-    except (ValueError, TypeError, UnicodeError, RecursionError):
+        totp_secret = None
+        if "totp_secret" in record:
+            if type(record["totp_secret"]) is not str:
+                raise ValueError
+            totp_secret = normalize_secret(record["totp_secret"])
+        return Credentials(account, password, "keyring", totp_secret=totp_secret)
+    except (ConfigurationError, ValueError, TypeError, UnicodeError, RecursionError):
         raise StorageFailure(
             "The stored credentials are malformed, oversized, or use an unsupported "
             "format. They were not changed; clear them explicitly before saving again."
